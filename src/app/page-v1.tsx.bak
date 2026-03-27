@@ -1,0 +1,881 @@
+'use client';
+
+import { useState, useRef, useCallback, useEffect } from 'react';
+import type {
+  AnalysisMode,
+  ViewMode,
+  FileInfo,
+  HistoryEntry,
+  LogEntry,
+  ToastData,
+  ClassificationResult,
+  SegmentationResult,
+} from '@/lib/types';
+import { validateFile, validateImageDimensions, fmtBytes } from '@/lib/validation';
+import { analyzeImage, ApiError } from '@/lib/api';
+import { generateMockClassification, generateMockSegmentation } from '@/lib/mockData';
+import {
+  PIPELINE_STEPS,
+  ANALYSIS_STEPS,
+  MODEL_INFO,
+  PREPROCESS_STEPS,
+  CLASS_COLORS,
+} from '@/lib/constants';
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+export default function Home() {
+  // State
+  const [task, setTask] = useState<AnalysisMode>('classify');
+  const [imgSrc, setImgSrc] = useState<string | null>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [fileInfo, setFileInfo] = useState<FileInfo | null>(null);
+  const [view, setView] = useState<ViewMode>('original');
+  const [maskData, setMaskData] = useState<ImageData | null>(null);
+  const [imgW, setImgW] = useState(0);
+  const [imgH, setImgH] = useState(0);
+
+  // Results
+  const [clsResult, setClsResult] = useState<ClassificationResult | null>(null);
+  const [segResult, setSegResult] = useState<SegmentationResult | null>(null);
+  const [showResults, setShowResults] = useState(false);
+  const [showSegMetrics, setShowSegMetrics] = useState(false);
+  const [showViewTabs, setShowViewTabs] = useState(false);
+
+  // Pipeline
+  const [pipStates, setPipStates] = useState<string[]>(['', '', '', '', '']);
+  const [pipLines, setPipLines] = useState<boolean[]>([false, false, false, false]);
+  const [ppDone, setPpDone] = useState<boolean[]>([false, false, false, false]);
+
+  // UI State
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [procText, setProcText] = useState('Initializing...');
+  const [procPct, setProcPct] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [threshold, setThreshold] = useState(50);
+  const [opacity, setOpacity] = useState(60);
+  const [toasts, setToasts] = useState<ToastData[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [clock, setClock] = useState('--:--:--');
+  const [coords, setCoords] = useState('0, 0');
+  const [rgb, setRgb] = useState('—');
+  const [scanGo, setScanGo] = useState(false);
+  const [usingMock, setUsingMock] = useState(false);
+
+  // Refs
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const scanRef = useRef<HTMLDivElement>(null);
+  const probBarsRef = useRef<HTMLDivElement>(null);
+
+  // Clock
+  useEffect(() => {
+    const tick = () => setClock(new Date().toLocaleTimeString('en-GB'));
+    tick();
+    const i = setInterval(tick, 1000);
+    return () => clearInterval(i);
+  }, []);
+
+  // Init logs
+  useEffect(() => {
+    addLog('BioLens AI v2.6 ready', 'ok');
+    addLog('Classification → EfficientNet-B3 · 12 classes · Focal Loss');
+    addLog('Segmentation → U-Net++ · Attention Gates · Dice+BCE');
+    addLog('Pipeline → Resize → Normalize → Stain Norm → Denoise');
+    addLog('Awaiting image upload...');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Toast helper
+  const addToast = useCallback((type: ToastData['type'], title: string, message: string) => {
+    const id = Date.now().toString();
+    setToasts((prev) => [...prev, { id, type, title, message }]);
+    const dur = type === 'suc' ? 3000 : 5000;
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), dur);
+  }, []);
+
+  const removeToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Log helper
+  const addLog = useCallback((message: string, type: LogEntry['type'] = '') => {
+    const time = new Date().toLocaleTimeString('en-GB');
+    setLogs((prev) => [{ time, message, type }, ...prev].slice(0, 50));
+  }, []);
+
+  // Error/warn/ok helpers
+  const showError = useCallback(
+    (title: string, msg: string) => {
+      addToast('err', title, msg);
+      addLog(`${title} — ${msg}`, 'er');
+    },
+    [addToast, addLog]
+  );
+
+  const showWarn = useCallback(
+    (title: string, msg: string) => {
+      addToast('wrn', title, msg);
+      addLog(`${title} — ${msg}`, 'wr');
+    },
+    [addToast, addLog]
+  );
+
+  const showOk = useCallback(
+    (msg: string) => {
+      addToast('suc', 'Success', msg);
+      addLog(msg, 'ok');
+    },
+    [addToast, addLog]
+  );
+
+  // File handling
+  const handleFile = useCallback(
+    (f: File) => {
+      const fileValidation = validateFile(f);
+      if (!fileValidation.valid) {
+        showError(fileValidation.error!.title, fileValidation.error!.message);
+        return;
+      }
+
+      setFile(f);
+
+      const reader = new FileReader();
+      reader.onerror = () => showError('Read Error', 'Could not read file. It may be corrupted or inaccessible.');
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onerror = () => showError('Decode Error', 'Image could not be decoded. Verify it is a valid PNG, JPG or BMP.');
+        img.onload = () => {
+          const dimValidation = validateImageDimensions(img.width, img.height);
+          if (!dimValidation.valid) {
+            showError(dimValidation.error!.title, dimValidation.error!.message);
+            return;
+          }
+          if (dimValidation.warning) {
+            showWarn(dimValidation.warning.title, dimValidation.warning.message);
+          }
+
+          const src = e.target!.result as string;
+          setImgSrc(src);
+          setImgW(img.width);
+          setImgH(img.height);
+          setFileInfo({
+            name: f.name,
+            width: img.width,
+            height: img.height,
+            size: f.size,
+            format: f.type.split('/')[1].toUpperCase(),
+          });
+
+          // Draw to canvas
+          const c = canvasRef.current!;
+          c.width = img.width;
+          c.height = img.height;
+          c.getContext('2d')!.drawImage(img, 0, 0);
+          c.style.display = 'block';
+
+          // Update pipeline
+          setPipStates((prev) => {
+            const n = [...prev];
+            n[0] = 'done';
+            return n;
+          });
+
+          addLog(`Loaded: ${f.name} (${img.width}×${img.height})`, 'ok');
+        };
+        img.src = e.target!.result as string;
+      };
+      reader.readAsDataURL(f);
+    },
+    [showError, showWarn, addLog]
+  );
+
+  // Drag handlers
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const onDragLeave = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    },
+    [handleFile]
+  );
+
+  // Viewer mouse move
+  const onViewerMove = useCallback(
+    (e: React.MouseEvent) => {
+      const box = viewerRef.current;
+      const c = canvasRef.current;
+      if (!box || !c || !c.width) return;
+      const r = box.getBoundingClientRect();
+      const x = Math.floor(((e.clientX - r.left) / r.width) * c.width);
+      const y = Math.floor(((e.clientY - r.top) / r.height) * c.height);
+      setCoords(`${x}, ${y}`);
+      try {
+        const p = c.getContext('2d')!.getImageData(x, y, 1, 1).data;
+        setRgb(`RGB(${p[0]}, ${p[1]}, ${p[2]})`);
+      } catch {
+        /* cross-origin */
+      }
+    },
+    []
+  );
+
+  // Paint overlay
+  const paintOverlay = useCallback(
+    (md: ImageData | null, currentView: ViewMode, currentOpacity: number) => {
+      if (!md) return;
+      const oc = overlayRef.current;
+      if (!oc) return;
+      const ctx = oc.getContext('2d')!;
+      const W = oc.width;
+      const H = oc.height;
+      const op = currentOpacity / 100;
+
+      if (currentView === 'original') {
+        oc.style.display = 'none';
+        return;
+      }
+      oc.style.display = 'block';
+
+      const out = ctx.createImageData(W, H);
+      const src = md.data;
+      for (let i = 0; i < src.length; i += 4) {
+        if (!src[i + 3]) continue;
+        if (currentView === 'mask') {
+          out.data[i] = out.data[i + 1] = out.data[i + 2] = 255;
+          out.data[i + 3] = 255;
+        } else if (currentView === 'overlay') {
+          out.data[i] = 37;
+          out.data[i + 1] = 99;
+          out.data[i + 2] = 235;
+          out.data[i + 3] = Math.floor(op * 200);
+        } else if (currentView === 'contour') {
+          const x = (i / 4) % W;
+          const y = Math.floor(i / 4 / W);
+          let edge = false;
+          for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]] as [number, number][]) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (nx >= 0 && nx < W && ny >= 0 && ny < H && !src[(ny * W + nx) * 4 + 3]) {
+              edge = true;
+              break;
+            }
+          }
+          if (edge) {
+            out.data[i] = 220;
+            out.data[i + 1] = 38;
+            out.data[i + 2] = 38;
+            out.data[i + 3] = 255;
+          }
+        } else if (currentView === 'heat') {
+          const t = Math.random();
+          if (t > 0.6) { out.data[i] = 220; out.data[i + 1] = 38; out.data[i + 2] = 38; }
+          else if (t > 0.3) { out.data[i] = 217; out.data[i + 1] = 119; out.data[i + 2] = 6; }
+          else { out.data[i] = 5; out.data[i + 1] = 150; out.data[i + 2] = 105; }
+          out.data[i + 3] = Math.floor(op * 170);
+        }
+      }
+      ctx.putImageData(out, 0, 0);
+    },
+    []
+  );
+
+  // Change view mode
+  const changeView = useCallback(
+    (m: ViewMode) => {
+      setView(m);
+      paintOverlay(maskData, m, opacity);
+    },
+    [maskData, opacity, paintOverlay]
+  );
+
+  // Analysis
+  const analyze = useCallback(async () => {
+    if (!imgSrc || !file) {
+      showError('No Image', 'Please upload an image first.');
+      return;
+    }
+
+    setIsProcessing(true);
+    setUsingMock(false);
+
+    // Reset pipeline
+    setPipStates(['done', '', '', '', '']);
+    setPipLines([false, false, false, false]);
+    setPpDone([false, false, false, false]);
+
+    // Animate steps
+    for (const step of ANALYSIS_STEPS) {
+      setProcText(step.text);
+      setProcPct(step.pct);
+      addLog(step.text);
+
+      if (step.ppStep !== undefined) {
+        setPpDone((prev) => {
+          const n = [...prev];
+          n[step.ppStep! - 1] = true;
+          return n;
+        });
+      }
+
+      if (step.pipStep !== undefined) {
+        setPipStates((prev) => {
+          const n = [...prev];
+          n[step.pipStep! - 1] = 'active';
+          return n;
+        });
+      }
+
+      if (step.pipLine !== undefined) {
+        setPipLines((prev) => {
+          const n = [...prev];
+          n[step.pipLine! - 1] = true;
+          return n;
+        });
+      }
+
+      await sleep(280 + Math.random() * 320);
+
+      if (step.pipStep !== undefined) {
+        setPipStates((prev) => {
+          const n = [...prev];
+          n[step.pipStep! - 1] = 'done';
+          return n;
+        });
+      }
+    }
+
+    // Try real API, fall back to mock
+    let classResult: ClassificationResult | null = null;
+    let segResultData: SegmentationResult | null = null;
+
+    try {
+      const response = await analyzeImage(file, task, { confidenceThreshold: threshold / 100 });
+      if (response.classification && (task === 'classify' || task === 'both')) {
+        classResult = response.classification;
+      }
+      if (response.segmentation && (task === 'segment' || task === 'both')) {
+        segResultData = response.segmentation;
+      }
+    } catch (e) {
+      const apiErr = e as ApiError;
+      showWarn('API Unavailable', `${apiErr.message}. Using demo mode.`);
+      setUsingMock(true);
+
+      if (task === 'classify' || task === 'both') {
+        classResult = generateMockClassification();
+      }
+      if (task === 'segment' || task === 'both') {
+        const oc = overlayRef.current!;
+        const mc = canvasRef.current!;
+        oc.width = mc.width;
+        oc.height = mc.height;
+        segResultData = generateMockSegmentation(oc);
+      }
+    }
+
+    // Scan bar animation
+    setScanGo(true);
+    await sleep(350);
+
+    // Hide processing
+    setIsProcessing(false);
+    setProcPct(0);
+
+    // Apply results
+    if (classResult) {
+      setClsResult(classResult);
+      setShowResults(true);
+      // Animate probability bars after render
+      setTimeout(() => {
+        const bars = probBarsRef.current?.querySelectorAll<HTMLDivElement>('.prob-bar');
+        bars?.forEach((el) => {
+          el.style.width = el.dataset.w + '%';
+        });
+      }, 50);
+    }
+
+    if (segResultData) {
+      setSegResult(segResultData);
+      setShowSegMetrics(true);
+      setShowViewTabs(true);
+      if (segResultData.mask_data) {
+        setMaskData(segResultData.mask_data);
+      }
+    }
+
+    // History
+    setHistory((prev) => [
+      {
+        thumb: imgSrc!,
+        name: file?.name || 'image',
+        task,
+        time: new Date().toLocaleTimeString('en-GB'),
+        cls: classResult?.predicted_class ?? null,
+      },
+      ...prev,
+    ]);
+
+    showOk(`Analysis complete — ${task} finished successfully.${usingMock ? ' (Demo mode)' : ''}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imgSrc, file, task, threshold, showError, showWarn, showOk, addLog]);
+
+  // Export
+  const doExport = useCallback(() => {
+    try {
+      const mc = canvasRef.current!;
+      const ec = document.createElement('canvas');
+      ec.width = mc.width;
+      ec.height = mc.height;
+      const ctx = ec.getContext('2d')!;
+      ctx.drawImage(mc, 0, 0);
+      const oc = overlayRef.current;
+      if (oc && oc.style.display !== 'none' && maskData) ctx.drawImage(oc, 0, 0);
+      const a = document.createElement('a');
+      a.download = 'biolens_' + Date.now() + '.png';
+      a.href = ec.toDataURL();
+      a.click();
+      showOk('Result exported as PNG');
+    } catch (e) {
+      showError('Export Failed', (e as Error).message);
+    }
+  }, [maskData, showOk, showError]);
+
+  // Sorted probabilities for rendering
+  const sortedProbs = clsResult
+    ? clsResult.probabilities
+        .map((v, i) => ({ v, i }))
+        .sort((a, b) => b.v - a.v)
+    : [];
+
+  const confClass = clsResult
+    ? clsResult.confidence > 0.7
+      ? 'c-hi'
+      : clsResult.confidence > 0.5
+      ? 'c-md'
+      : 'c-lo'
+    : '';
+
+  return (
+    <>
+      {/* Accent bar */}
+      <div className="accent-bar" />
+
+      {/* Disclaimer */}
+      <div className="disclaimer">
+        &#9888; For research and demonstration purposes only. Not for clinical use.
+      </div>
+
+      {/* Header */}
+      <header>
+        <div className="brand">
+          <div className="brand-mark">
+            <svg viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="7" stroke="#fff" strokeWidth="1.5" />
+              <circle cx="12" cy="12" r="2.5" fill="#fff" />
+              <path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+          </div>
+          <div>
+            <div className="brand-name">BioLens AI</div>
+            <div className="brand-ver">v2.6 &middot; biopsy intelligence</div>
+          </div>
+        </div>
+        <div className="header-r">
+          <div className="chip">
+            <div className="dot"></div>System Active
+          </div>
+          <div className="chip" style={{ minWidth: 74 }}>{clock}</div>
+        </div>
+      </header>
+
+      {/* Pipeline */}
+      <div className="pipeline">
+        {PIPELINE_STEPS.map((step, idx) => (
+          <span key={step.id} style={{ display: 'contents' }}>
+            <div className={`pip-step ${pipStates[idx]}`}>
+              <div className="pip-n">
+                {pipStates[idx] === 'done' ? '✓' : step.id}
+              </div>
+              {step.label}
+            </div>
+            {idx < 4 && (
+              <div className={`pip-line ${pipLines[idx] ? 'done' : ''}`}></div>
+            )}
+          </span>
+        ))}
+      </div>
+
+      {/* Main Grid */}
+      <div className="main">
+        {/* LEFT PANEL */}
+        <div className="col">
+          <div className="lbl">Image Input</div>
+
+          {/* Drop Zone */}
+          <div
+            className={`drop-zone ${isDragging ? 'over' : ''} ${imgSrc ? 'loaded' : ''}`}
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}
+          >
+            {!imgSrc && (
+              <div>
+                <div className="dz-icon">
+                  <svg viewBox="0 0 24 24" fill="none" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
+                  </svg>
+                </div>
+                <div className="dz-title">Upload biopsy image</div>
+                <div className="dz-sub">Drag &amp; drop or click to browse</div>
+                <div className="dz-tags">
+                  <span className="dz-tag">PNG</span>
+                  <span className="dz-tag">JPG</span>
+                  <span className="dz-tag">BMP</span>
+                </div>
+              </div>
+            )}
+            {imgSrc && (
+              <img src={imgSrc} alt="Preview" className="preview-img" />
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/bmp"
+              hidden
+              onChange={(e) => {
+                if (e.target.files?.length) handleFile(e.target.files[0]);
+              }}
+            />
+          </div>
+
+          {/* File Info */}
+          {fileInfo && (
+            <div className="file-info">
+              <div className="fi-row"><span className="fi-k">Filename</span><span className="fi-v">{fileInfo.name}</span></div>
+              <div className="fi-row"><span className="fi-k">Dimensions</span><span className="fi-v">{fileInfo.width}×{fileInfo.height}px</span></div>
+              <div className="fi-row"><span className="fi-k">File size</span><span className="fi-v">{fmtBytes(fileInfo.size)}</span></div>
+              <div className="fi-row"><span className="fi-k">Format</span><span className="fi-v">{fileInfo.format}</span></div>
+            </div>
+          )}
+
+          <div className="lbl" style={{ marginTop: 18 }}>Analysis Mode</div>
+          <div className="tabs">
+            {(['classify', 'segment', 'both'] as AnalysisMode[]).map((m) => (
+              <button
+                key={m}
+                className={`tab ${task === m ? 'on' : ''}`}
+                onClick={() => { setTask(m); addLog(`Mode → ${m}`); }}
+              >
+                {m === 'classify' ? 'Classification' : m === 'segment' ? 'Segmentation' : 'Both'}
+              </button>
+            ))}
+          </div>
+
+          <div className="lbl" style={{ marginTop: 18 }}>Model Architecture</div>
+          {Object.values(MODEL_INFO).map((model) => (
+            <div className="info-card" key={model.title}>
+              <div className="ic-head">
+                <div className="ic-title">{model.title}</div>
+                <div className="ic-badge">{model.badge}</div>
+              </div>
+              {model.rows.map(([k, v]) => (
+                <div className="ic-row" key={k}>
+                  <span className="ic-k">{k}</span>
+                  <span className="ic-v">{v}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+
+          <div className="lbl" style={{ marginTop: 18 }}>Preprocessing Pipeline</div>
+          {PREPROCESS_STEPS.map((step, idx) => (
+            <div className={`pp-step ${ppDone[idx] ? 'done' : ''}`} key={idx}>
+              <div className="pp-dot">{ppDone[idx] ? '✓' : idx + 1}</div>
+              <div>
+                <div className="pp-label">{step.label}</div>
+                <div className="pp-desc">{step.desc}</div>
+              </div>
+            </div>
+          ))}
+
+          <div className="lbl" style={{ marginTop: 18 }}>Settings</div>
+          <div className="sld-row">
+            <span className="sld-lbl">Confidence threshold</span>
+            <div className="sld-ctrl">
+              <input
+                type="range"
+                className="sld"
+                min={10}
+                max={95}
+                value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))}
+              />
+              <span className="sld-v">{(threshold / 100).toFixed(2)}</span>
+            </div>
+          </div>
+          <div className="sld-row">
+            <span className="sld-lbl">Mask opacity</span>
+            <div className="sld-ctrl">
+              <input
+                type="range"
+                className="sld"
+                min={10}
+                max={100}
+                value={opacity}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setOpacity(v);
+                  paintOverlay(maskData, view, v);
+                }}
+              />
+              <span className="sld-v">{(opacity / 100).toFixed(2)}</span>
+            </div>
+          </div>
+
+          <button
+            className="go-btn"
+            disabled={!imgSrc || isProcessing}
+            onClick={analyze}
+          >
+            <span className="shine"></span>
+            {isProcessing ? 'Analyzing...' : 'Run Analysis'}
+          </button>
+        </div>
+
+        {/* CENTER PANEL */}
+        <div className="col viewer-col">
+          <div className="lbl" style={{ alignSelf: 'flex-start', width: '100%' }}>Scan Viewer</div>
+          <div className="viewer-box" ref={viewerRef} onMouseMove={onViewerMove}>
+            <div className="v-corner v-tl"></div>
+            <div className="v-corner v-tr"></div>
+            <div className="v-corner v-bl"></div>
+            <div className="v-corner v-br"></div>
+            <div ref={scanRef} className={`scan-bar ${scanGo ? 'go' : ''}`} onAnimationEnd={() => setScanGo(false)}></div>
+
+            {!imgSrc && (
+              <div className="v-empty">
+                <svg viewBox="0 0 56 56" fill="none">
+                  <rect x="6" y="6" width="44" height="44" rx="6" stroke="currentColor" strokeWidth="1.5" />
+                  <circle cx="28" cy="28" r="10" stroke="currentColor" strokeWidth="1" strokeDasharray="3 3" />
+                  <path d="M28 22v12M22 28h12" stroke="currentColor" strokeWidth="1" opacity="0.4" />
+                </svg>
+                <div className="ve-t">No image loaded</div>
+                <div className="ve-s">Upload a biopsy image to begin analysis</div>
+              </div>
+            )}
+
+            <canvas ref={canvasRef} className="canvas-main" style={{ display: imgSrc ? 'block' : 'none' }} />
+            <canvas ref={overlayRef} className="canvas-overlay" />
+            {imgSrc && (
+              <div className="v-bar" style={{ display: 'flex' }}>
+                <span>{coords}</span>
+                <span>{rgb}</span>
+              </div>
+            )}
+          </div>
+
+          {/* View mode tabs */}
+          {showViewTabs && (
+            <div className="v-tabs" style={{ display: 'flex' }}>
+              {(['original', 'mask', 'overlay', 'contour', 'heat'] as ViewMode[]).map((m) => (
+                <button key={m} className={`v-tab ${view === m ? 'on' : ''}`} onClick={() => changeView(m)}>
+                  {m === 'heat' ? 'Heatmap' : m.charAt(0).toUpperCase() + m.slice(1)}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Comparison slider */}
+          {showViewTabs && (
+            <div className="v-slider" style={{ display: 'flex' }}>
+              <label>Original</label>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                defaultValue={100}
+                onChange={(e) => {
+                  const oc = overlayRef.current;
+                  if (oc) oc.style.clipPath = `inset(0 ${100 - Number(e.target.value)}% 0 0)`;
+                }}
+              />
+              <label>Overlay</label>
+            </div>
+          )}
+
+          <div style={{ width: '100%', maxWidth: 560, marginTop: 22 }}>
+            <div className="lbl">History</div>
+            {history.length === 0 && (
+              <div style={{ fontSize: 11, color: 'var(--text-3)', textAlign: 'center', padding: 12 }}>
+                No analyses performed yet
+              </div>
+            )}
+            {history.map((h, idx) => (
+              <div className="hist-item" key={idx}>
+                <img className="hist-img" src={h.thumb} alt="" />
+                <div>
+                  <div className="hist-name">{h.name}</div>
+                  <div className="hist-meta">
+                    {h.task} &middot; {h.time}
+                    {h.cls !== null ? ` · Class ${h.cls}` : ''}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* RIGHT PANEL */}
+        <div className="col">
+          <div className="lbl">Analysis Results</div>
+
+          {!showResults && !showSegMetrics && (
+            <div className="res-empty">
+              <svg viewBox="0 0 44 44" fill="none">
+                <rect x="4" y="4" width="36" height="36" rx="4" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M15 22h14M22 15v14" stroke="currentColor" strokeWidth="1" opacity="0.3" />
+              </svg>
+              <div style={{ fontWeight: 500, marginBottom: 2 }}>Awaiting analysis</div>
+              <div style={{ fontSize: 11 }}>Upload an image and run analysis to see results</div>
+            </div>
+          )}
+
+          {/* Classification Results */}
+          {clsResult && showResults && (
+            <>
+              <div className="pred-hero show">
+                <div className="ph-label">Predicted Class</div>
+                <div className="ph-class">Class {clsResult.predicted_class}</div>
+                <div className={`ph-conf ${confClass}`}>
+                  {(clsResult.confidence * 100).toFixed(1)}% confidence
+                </div>
+                {usingMock && (
+                  <div style={{ fontSize: 10, color: 'var(--amber)', marginTop: 8, fontFamily: 'var(--mono)' }}>
+                    Demo mode — simulated results
+                  </div>
+                )}
+              </div>
+
+              <div className="lbl">Class Probabilities</div>
+              <div className="prob-list" ref={probBarsRef}>
+                {sortedProbs.map(({ v, i }) => (
+                  <div className="prob-item" key={i}>
+                    <span className="prob-id">{i}</span>
+                    <div className="prob-track">
+                      <div
+                        className="prob-bar"
+                        data-w={v * 100}
+                        style={{ background: CLASS_COLORS[i], width: 0 }}
+                      ></div>
+                    </div>
+                    <span className="prob-pct">{(v * 100).toFixed(1)}%</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* Segmentation Metrics */}
+          {segResult && showSegMetrics && (
+            <div className="seg-box show">
+              <div className="lbl">Segmentation Metrics</div>
+              <div className="seg-grid">
+                <div className="seg-cell">
+                  <div className="seg-n" style={{ color: 'var(--emerald)' }}>
+                    {segResult.coverage.toFixed(1)}%
+                  </div>
+                  <div className="seg-l">Coverage</div>
+                </div>
+                <div className="seg-cell">
+                  <div className="seg-n" style={{ color: 'var(--blue)' }}>
+                    {segResult.confidence.toFixed(2)}
+                  </div>
+                  <div className="seg-l">Confidence</div>
+                </div>
+                <div className="seg-cell">
+                  <div className="seg-n" style={{ color: 'var(--violet)' }}>
+                    {segResult.regions}
+                  </div>
+                  <div className="seg-l">Regions</div>
+                </div>
+                <div className="seg-cell">
+                  <div className="seg-n" style={{ color: 'var(--amber)' }}>
+                    {segResult.area_px.toLocaleString()}
+                  </div>
+                  <div className="seg-l">Area (px²)</div>
+                </div>
+              </div>
+              {usingMock && (
+                <div style={{ fontSize: 10, color: 'var(--amber)', marginTop: 8, fontFamily: 'var(--mono)', textAlign: 'center' }}>
+                  Demo mode — simulated segmentation
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Export */}
+          {(showResults || showSegMetrics) && (
+            <button className="exp-btn show" onClick={doExport}>
+              ↓ Export results as PNG
+            </button>
+          )}
+
+          <div style={{ marginTop: 20 }}>
+            <div className="lbl">System Log</div>
+            <div className="log-box">
+              {logs.map((log, idx) => (
+                <div className="log-e" key={idx}>
+                  <span className="log-t">{log.time}</span>
+                  <span className={`log-m ${log.type}`}>{log.message}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Processing Overlay */}
+      {isProcessing && (
+        <div className="proc on">
+          <div className="proc-inner">
+            <div className="proc-ring"></div>
+            <div className="proc-title">Analyzing Image</div>
+            <div className="proc-sub">{procText}</div>
+            <div className="proc-bar">
+              <div className="proc-fill" style={{ width: `${procPct}%` }}></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toasts */}
+      <div className="toast-container">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.type}`}>
+            <button className="toast-x" onClick={() => removeToast(t.id)}>✕</button>
+            <div className="toast-ti">{t.title}</div>
+            <div className="toast-tx">{t.message}</div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
